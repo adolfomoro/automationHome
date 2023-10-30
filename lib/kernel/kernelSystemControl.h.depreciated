@@ -1,0 +1,934 @@
+#include <LittleFS.h>
+#include <ESPAsyncWebServer.h>
+#include <NTPClient.h>
+#include <ESP8266WiFi.h>
+#include "ArduinoJson.h"
+#include <DNSServer.h>
+#include <ESP8266mDNS.h>
+#include <pages.h>
+#include <Ticker.h>
+#include <PubSubClient.h>
+#include <kernelDevice.h>
+//PAGES
+#include <pages/PAGE_SIGN_UP_USER.h>
+#include <pages/PAGE_WIFI_SETUP.h>
+#include <pages/PAGE_SECURITY.h>
+#include <pages/PAGE_SETTINGS.h>
+#include <pages/PAGE_RESET.h>
+#include <pages/PAGE_LOGS.h>
+void callback(char* topic, byte* payload, unsigned int length);
+//##### CONFIG TIME . BEGIN #####
+WiFiUDP ntpUDP;
+const int TIME_ZONE = -3;
+const String TIME_NTP_SERVER = "br.pool.ntp.org";
+NTPClient NTP_TIME_CLIENT(
+    ntpUDP,
+    TIME_NTP_SERVER.c_str(),
+    TIME_ZONE * 3600,
+    30000);
+//##### CONFIG TIME . END #####
+   
+class kernelSystemControl
+{
+private:
+WiFiClient espClient;                                                   
+PubSubClient clientMQTT;
+  //##### GENERAL VAR . BEGIN #####
+  const String COMPANY = "System Control";
+  const String FILE_CONFIG_NAME = "/config.json";
+
+  struct wifiList {
+    String SSID;
+    String PWD;
+  } aa;
+  struct config {
+    int start = 0;
+    String MAC;
+    String CHIP_ID;
+    uint32_t FLASH_SIZE;
+
+    String LoginUser;
+    String LoginPWD;
+
+    String BoardName;
+    String ServerType;
+    String ServerIP;
+    int serverPort;
+    String ServerUser;
+    String ServerPWD;
+
+    wifiList wifiListNetwork[10];
+    int sizeListWifi = 0;
+    String wifiListNetworkJson;
+  } configLoad;
+  //##### GENERAL VAR . END #####
+
+  //##### WIFI . BEGIN #####
+  const byte DNS_PORT = 53;
+  DNSServer DNS_SERVER;
+  AsyncWebServer WEB_SERVER = AsyncWebServer(80);
+
+  bool WIFI_STA_INICIALIZED = false;
+  bool MQTT_INICIALIZED = false;
+  int LAST_STATUS_WIFI_STA = WL_IDLE_STATUS;
+  const char *STA_HOST_NAME = "TOLFIN";
+  boolean isIp(String str) {
+  for (int i = 0; i < str.length(); i++) {
+    int c = str.charAt(i);
+    if (c != '.' && (c < '0' || c > '9')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+  void loadConfig(){
+    DynamicJsonDocument doc(1536);
+    JsonObject obj;
+    obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+    configLoad.start = obj["START"];
+
+    configLoad.MAC = obj["MAC"].as<String>();
+    configLoad.CHIP_ID = obj["CHIP"].as<String>();
+    configLoad.FLASH_SIZE = obj["FLASH_SIZE"];
+
+    configLoad.LoginUser = obj["LOGIN_USER"].as<String>();
+    configLoad.LoginPWD = obj["LOGIN_PWD"].as<String>();
+
+    configLoad.BoardName = obj["BOARD_NAME"].as<String>();
+    configLoad.ServerType = obj["SERVER_TYPE"].as<String>();
+    configLoad.ServerIP = obj["SERVER_IP"].as<String>();
+    configLoad.serverPort = obj["SERVER_PORT"];
+    configLoad.ServerUser = obj["SERVER_USER"].as<String>();
+    configLoad.ServerPWD = obj["SERVER_PWD"].as<String>();
+
+    configLoad.sizeListWifi = 0;
+    //clear wifi list
+    memset(configLoad.wifiListNetwork, 0, sizeof(configLoad.wifiListNetwork));
+    configLoad.wifiListNetworkJson = "[";
+    for (int i=0; i < obj["WIFI_NETWORKS"].size(); i++) {
+      configLoad.wifiListNetwork[i].SSID = obj["WIFI_NETWORKS"][i]["SSID"].as<String>();
+      configLoad.wifiListNetwork[i].PWD = obj["WIFI_NETWORKS"][i]["PWD"].as<String>();
+      configLoad.wifiListNetworkJson += "{'SSID':'"+configLoad.wifiListNetwork[i].SSID + "', 'pwd':'"+configLoad.wifiListNetwork[i].PWD+"'},";
+      ++configLoad.sizeListWifi;
+    }
+    configLoad.wifiListNetworkJson += "]";
+    
+
+  }
+
+String toStringIp(IPAddress ip) {
+  String res = "";
+  for (int i = 0; i < 3; i++) {
+    res += String((ip >> (8 * i)) & 0xFF) + ".";
+  }
+  res += String(((ip >> 8 * 3)) & 0xFF);
+  return res;
+}
+  boolean captivePortal(AsyncWebServerRequest *request) {
+    if (!isIp(request->host()) && request->host() != (String(STA_HOST_NAME)+".local")) {
+      request->redirect(String("http://") + toStringIp(WiFi.softAPIP())+"/");
+      request->send_P(302, "text/plain", "");
+      request->client()->close();
+      return true;
+    }
+    return false;
+  }
+  bool checkSecuritySystem(AsyncWebServerRequest *request){
+    loadConfig();
+    if (configLoad.LoginUser == "" || configLoad.LoginPWD == ""){
+      renderPage(request, "Sign up User", PAGE_SIGN_UP_USER);
+      return false;
+    }
+    //check Wifi network configured or exist
+    if(configLoad.sizeListWifi <= 0){
+      renderPage(request, "Wifi Settings", PAGE_WIFI_SETUP, [=](String processor){
+        if (processor == "NETWORKS"){
+          String var = "[";
+          for (int i=0; i < configLoad.sizeListWifi; i++) {
+            var += "{'SSID':'"+configLoad.wifiListNetwork[i].SSID + "', 'pwd':'"+configLoad.wifiListNetwork[i].PWD+"'},";
+          }
+          var += "]";
+          return var;
+        }
+        return String();
+      });
+      return false;
+    }
+    if(!request->authenticate(configLoad.LoginUser.c_str(), configLoad.LoginPWD.c_str())){
+      request->requestAuthentication();
+      return false;
+    }
+
+    return true;
+  }
+  typedef std::function<String(const String&)> TemplateProcessor;
+  void renderPage(AsyncWebServerRequest *request, String title, String page, TemplateProcessor secondProcessor = NULL ){
+    request->send_P(200, "text/html", PAGE_HEADER, [=](const String& var){
+      if (var  == "TITLE"){
+        return title;
+      }else if (var == "PAGE"){
+        return page;
+      }else if (var == "COMPANY"){
+        return COMPANY;
+      }else if (var == "WIFI_STATUS"){
+        if (WiFi.status() == WL_CONNECTED){
+          return String("Connected");
+        }else{
+          return String("Disconnected");
+        }
+      }else if (var == "SERVER_STATUS"){
+        if (clientMQTT.connected()){
+          return String("Connected");
+        }else{
+          return String("Disconnected");
+        }
+      }else if (var == "NETWORKS_LOAD"){
+        return configLoad.wifiListNetworkJson;
+      }else{
+        if (secondProcessor == NULL){
+          return String();
+        }else{
+          return secondProcessor(var);
+        }
+      }
+    });
+  }
+  int sizeDoc(){
+    return ESP.getMaxFreeBlockSize() - 512;
+  }
+  void startServerWeb(){
+    //FILES REQUIRES
+    WEB_SERVER.on("/bootstrap.min.css", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/bootstrap.min.css", "text/css");
+    });
+    WEB_SERVER.on("/jquery.min.js", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/jquery.min.js", "text/javascript");
+    });
+    WEB_SERVER.on("/jquery.mask.min.js", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/jquery.mask.min.js", "text/javascript");
+    });
+    WEB_SERVER.on("/log.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/log.txt", String(), false);
+    });
+    WEB_SERVER.on("/config.json", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/config.json", "application/json");
+    });
+    //WEB SERVICES
+    WEB_SERVER.on("/sign_up_user", HTTP_GET, [=](AsyncWebServerRequest *request){
+      String outUser;
+      String outPwd;
+      if (request->hasParam("USER") && request->hasParam("PWD")) {
+        outUser= request->getParam("USER")->value();
+        outPwd= request->getParam("PWD")->value();
+        if (outUser == "" || outPwd == ""){
+          request->send(500, "text/html", "User and Password required");
+          return;
+        }else{
+          DynamicJsonDocument doc(2048);
+          JsonObject obj;
+          obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+          if (obj["LOGIN_USER"] != "" || obj["LOGIN_PWD"] != "" ){
+            request->send(500, "text/html", "User exist");
+          }else{
+            obj["LOGIN_USER"] = outUser;
+            obj["LOGIN_PWD"] = outPwd;
+            if (saveJSonToAFile(&doc, FILE_CONFIG_NAME)){
+              request->send(200, "text/html", "true");
+            }else{
+              request->send(500, "text/html", "Error save data");
+            }
+          }
+        }
+    }else {
+        request->send(500, "text/html", "User or Password not found");
+    }
+    });
+    WEB_SERVER.on("/change_user", HTTP_GET, [=](AsyncWebServerRequest *request){
+      String outUser;
+      if (request->hasParam("user")) {
+        outUser= request->getParam("user")->value();
+        if (outUser == ""){
+          request->send(500, "text/html", "User required");
+          return;
+        }else{
+          DynamicJsonDocument doc(2048);
+          JsonObject obj;
+          obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+          obj["LOGIN_USER"] = outUser;
+          if (saveJSonToAFile(&doc, FILE_CONFIG_NAME)){
+            request->send(200, "text/html", "true");
+          }else{
+            request->send(500, "text/html", "Error save data");
+          }
+          
+        }
+    }else {
+        request->send(500, "text/html", "User not found");
+    }
+    });
+    WEB_SERVER.on("/change_pwd", HTTP_GET, [=](AsyncWebServerRequest *request){
+      String outPwd;
+      String outPwdConfirm;
+      if (request->hasParam("PWD") && request->hasParam("pwd_confirm")) {
+        outPwd= request->getParam("PWD")->value();
+        outPwdConfirm= request->getParam("pwd_confirm")->value();
+        if (outPwd == "" || outPwdConfirm == ""){
+          request->send(500, "text/html", "User and Password required");
+          return;
+        }else{
+          DynamicJsonDocument doc(2048);
+          JsonObject obj;
+          obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+          if (outPwd == outPwdConfirm){
+            obj["LOGIN_PWD"] = outPwd;
+            if (saveJSonToAFile(&doc, FILE_CONFIG_NAME)){
+              request->send(200, "text/html", "true");
+            }else{
+              request->send(500, "text/html", "Error save data");
+            }
+          }else{
+            request->send(500, "text/html", "Password not equals");
+          }
+        }
+    }else {
+        request->send(500, "text/html", "Password or Confirm Password not found");
+    }
+    });
+    WEB_SERVER.on("/network/add", HTTP_GET, [=](AsyncWebServerRequest *request){
+      String outSSID;
+      String outPwd;
+      if (request->hasParam("SSID") && request->hasParam("PWD")) {
+        outSSID= request->getParam("SSID")->value();
+        outPwd= request->getParam("PWD")->value();
+        if (outSSID == "" || outPwd == ""){
+          request->send(500, "text/html", "SSID and Password required");
+        }else{
+          DynamicJsonDocument doc(2048);
+          JsonObject obj;
+          obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+          JsonArray array = obj["WIFI_NETWORKS"];
+          if (array.size() >= 8){
+            request->send(401, "text/html", "Max Network added");
+            return;
+          }
+          for (int i=0; i<array.size(); i++) { //iterate through each object in an array
+            if (array[i]["SSID"] == outSSID ) {
+              request->send(401, "text/html", "SSID Exist");
+              return;
+            }
+          }
+          JsonObject object = array.createNestedObject();
+          object["SSID"] = outSSID;
+          object["PWD"] = outPwd;
+          saveJSonToAFile(&doc, FILE_CONFIG_NAME);
+          String var = "";
+          serializeJson(array, var);
+          request->send(200, "text/json", var);
+        }
+      }else{
+        request->send(401, "text/html", "Error save data");
+      }
+    });
+    WEB_SERVER.on("/network/delete", HTTP_GET, [=](AsyncWebServerRequest *request){
+      String outSSID;
+      if (request->hasParam("SSID")) {
+        outSSID= request->getParam("SSID")->value();
+        if (outSSID == ""){
+          request->send(500, "text/html", "SSID required");
+        }else{
+          DynamicJsonDocument doc(2048);
+          JsonObject obj;
+          obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+          JsonArray array = obj["WIFI_NETWORKS"];
+          for (int i=0; i<array.size(); i++) { //iterate through each object in an array
+            if (array[i]["SSID"] == outSSID ) {
+              array.remove(i);
+              saveJSonToAFile(&doc, FILE_CONFIG_NAME);
+              String var = "";
+              serializeJson(array, var);
+              request->send(200, "text/json", var);
+              return;
+            }
+          }
+          request->send(500, "text/html", "Not found SSID");
+        }
+      }else{
+        request->send(500, "text/html", "Error save data");
+      }
+    });
+    WEB_SERVER.on("/set_settings", HTTP_GET, [=](AsyncWebServerRequest *request){
+      String boardName;
+      String serverType;
+      String serverIP;
+      String serverPort;
+      String serverUser;
+      String serverPWD;
+      if (request->hasParam("board_name") && request->hasParam("server_type") && request->hasParam("server_ip") && request->hasParam("server_port") && request->hasParam("server_user") && request->hasParam("server_pwd")) {
+        boardName= request->getParam("board_name")->value();
+        serverType= request->getParam("server_type")->value();
+        serverIP= request->getParam("server_ip")->value();
+        serverPort= request->getParam("server_port")->value();
+        serverUser= request->getParam("server_user")->value();
+        serverPWD= request->getParam("server_pwd")->value();
+        if (boardName == "" || serverType == "" || serverPort == "" || serverUser == "" || serverIP == ""){
+          request->send(500, "text/html", "Check itens required");
+        }else{
+          DynamicJsonDocument doc(2048);
+          JsonObject obj;
+          obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+          obj["BOARD_NAME"] = boardName;
+          obj["SERVER_TYPE"] = serverType;
+          obj["SERVER_IP"] = serverIP;
+          obj["SERVER_PORT"] = serverPort;
+          obj["SERVER_USER"] = serverUser;
+          obj["SERVER_PWD"] = serverPWD;
+          saveJSonToAFile(&doc, FILE_CONFIG_NAME);
+          request->send(200, "text/html", "true");
+        }
+      }else{
+        request->send(500, "text/html", "Error save data");
+      }
+    });
+
+
+
+
+
+
+
+
+    WEB_SERVER.on("/reset_c", HTTP_GET, [=](AsyncWebServerRequest *request){
+      String pwd;
+      String pwd_confirm;
+      if (request->hasParam("PWD") && request->hasParam("PWD_CONFIRM")) {
+        pwd= request->getParam("PWD")->value();
+        pwd_confirm= request->getParam("PWD_CONFIRM")->value();
+        if (pwd == ""){
+          request->send(200, "text/html", "Password not empty");
+          return;
+        }
+        if (pwd_confirm == ""){
+          request->send(200, "text/html", "Confirm Password not empty");
+          return;
+        }
+        if (pwd != pwd_confirm){
+          request->send(200, "text/html", "Password not equals");
+          return;
+        }else{
+          DynamicJsonDocument doc(2048);
+          JsonObject obj;
+          obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+          if (obj["LOGIN_PWD"] == pwd){
+            LittleFS.remove(FILE_CONFIG_NAME);
+            LittleFS.remove("/log.txt");
+            request->send(200, "text/html", "true");
+          }else{
+            request->send(200, "text/html", "Password incorrect");
+          }
+        }
+      }
+    });
+    WEB_SERVER.on("/restart_c", HTTP_GET, [](AsyncWebServerRequest *request){
+      delay(1500);
+      ESP.reset();
+    });
+    WEB_SERVER.on("/restart", HTTP_GET, [=](AsyncWebServerRequest *request){
+      renderPage(request, "Restarting...", PAGE_RESTART_BOARD);
+    });
+    
+    //PAGES
+    WEB_SERVER.on("/", HTTP_GET, [=](AsyncWebServerRequest *request){
+      if (captivePortal(request)) { // If caprive portal redirect instead of displaying the page.
+        return;
+      }
+      if (!checkSecuritySystem(request)){
+        return;
+      }
+      renderPage(request, "Tolfin Home Control", INDEX_PAGE);
+    });
+    WEB_SERVER.on("/security", HTTP_GET, [=](AsyncWebServerRequest *request){
+      if (captivePortal(request)) { // If caprive portal redirect instead of displaying the page.
+        return;
+      }
+      if (!checkSecuritySystem(request)){
+        return;
+      }
+      renderPage(request, "Tolfin Home Control", PAGE_SECURITY);
+    });
+    WEB_SERVER.on("/network", HTTP_GET, [=](AsyncWebServerRequest *request){
+      if (captivePortal(request)) { // If caprive portal redirect instead of displaying the page.
+        return;
+      }
+      if (!checkSecuritySystem(request)){
+        return;
+      }
+      renderPage(request, "Wifi Settings", PAGE_WIFI_SETUP, [=](String processor){
+        if (processor == "NETWORKS"){
+          String var = "[";
+          for (int i=0; i < configLoad.sizeListWifi; i++) {
+            var += "{'SSID':'"+configLoad.wifiListNetwork[i].SSID + "', 'pwd':'"+configLoad.wifiListNetwork[i].PWD+"'},";
+          }
+          var += "]";
+          return var;
+        }
+        return String();
+      });
+    });
+    WEB_SERVER.on("/settings", HTTP_GET, [=](AsyncWebServerRequest *request){
+      if (captivePortal(request)) { // If caprive portal redirect instead of displaying the page.
+        return;
+      }
+      if (!checkSecuritySystem(request)){
+        return;
+      }
+      renderPage(request, "Tolfin Home Control", PAGE_SETTINGS, [=](String processor){
+        if (processor == "BOARD_NAME"){
+          String var = configLoad.BoardName;
+          return var;
+        }
+        if (processor == "SERVER_TYPE"){
+          String var = configLoad.ServerType;
+          return var;
+        }
+        if (processor == "SERVER_IP"){
+          String var = configLoad.ServerIP;
+          return var;
+        }
+        if (processor == "SERVER_PORT"){
+          String var = String(configLoad.serverPort);
+          return var;
+        }
+        if (processor == "SERVER_USER"){
+          String var = configLoad.ServerUser;
+          return var;
+        }
+        if (processor == "SERVER_PWD"){
+          String var = configLoad.ServerPWD;
+          return var;
+        }
+        return String();
+      });
+    });
+    WEB_SERVER.on("/logs", HTTP_GET, [=](AsyncWebServerRequest *request){
+      if (captivePortal(request)) { // If caprive portal redirect instead of displaying the page.
+        return;
+      }
+      if (!checkSecuritySystem(request)){
+        return;
+      }
+      renderPage(request, "Tolfin Home Control", PAGE_LOGS, [=](String processor){
+        if (processor == "LOGS"){
+
+           File f = LittleFS.open("/log.txt","r");
+           String log = "[";
+ while(f.available()) {
+
+ log += f.readStringUntil('/n').c_str();
+
+ }
+ log += "]";
+
+          return log;
+
+        }
+        return String();
+      });
+    });
+    WEB_SERVER.on("/reset", HTTP_GET, [=](AsyncWebServerRequest *request){
+      if (captivePortal(request)) { // If caprive portal redirect instead of displaying the page.
+        return;
+      }
+      if (!checkSecuritySystem(request)){
+        return;
+      }
+      renderPage(request, "Tolfin Home Control", PAGE_RESET);
+    });
+    WEB_SERVER.onNotFound([=](AsyncWebServerRequest *request){
+      if (captivePortal(request)) { // If caprive portal redirect instead of displaying the page.
+        return;
+      }
+      request->send(404, "text/html", "404 - NOT FOUND PAGE");
+    });
+    
+  }
+  //##### WIFI . END #####
+
+  //##### FILE SYSTEM . BEGIN #####
+  bool FILE_SYSTEM_OPEN = false;
+  void openLittleFS(void)
+  {
+    // Abre o sistema de arquivos
+    if (!LittleFS.begin())
+    {
+      FILE_SYSTEM_OPEN = false;
+      SerialPrint(SerialType::Error, "Erro ao abrir o sistema de arquivos");
+    }
+    else
+    {
+      FILE_SYSTEM_OPEN = true;
+      SerialPrint(SerialType::Info, "Sistema de arquivos aberto com sucesso!");
+    }
+  }
+  bool checkFileExist(String filename){
+    bool fileExist = LittleFS.exists(filename);
+    return fileExist;
+  }
+  JsonArray getFileFromArray(DynamicJsonDocument *doc, String filename, bool forceCleanONJsonError = true)
+  {
+    File rFile = LittleFS.open(filename, "a+");
+    if (rFile)
+    {
+      DeserializationError error = deserializeJson(*doc, rFile);
+      if (error)
+      {
+        if (forceCleanONJsonError)
+        {
+          return doc->to<JsonArray>();
+        }
+      }
+      rFile.close();
+      return doc->as<JsonArray>();
+    }
+    else
+    {
+      return doc->to<JsonArray>();
+    }
+  }
+  JsonObject getFileFromObject(DynamicJsonDocument *doc, String filename, bool forceCleanONJsonError = true)
+  {
+    File rFile = LittleFS.open(filename, "a+");
+    if (rFile)
+    {
+      DeserializationError error = deserializeJson(*doc, rFile);
+      if (error)
+      {
+        if (forceCleanONJsonError)
+        {
+          return doc->to<JsonObject>();
+        }
+      }
+      rFile.close();
+      return doc->as<JsonObject>();
+    }
+    else
+    {
+      return doc->to<JsonObject>();
+    }
+  }
+  bool saveConfigFile(DynamicJsonDocument *doc){
+    if (saveJSonToAFile(doc, FILE_CONFIG_NAME)){
+      loadConfig();
+      return true;
+    }else{
+      return false;
+    }
+  }
+  bool saveJSonToAFile(DynamicJsonDocument *doc, String filename)
+  {
+    File rFile = LittleFS.open(filename, "w+");
+    if (rFile)
+    {
+      serializeJson(*doc, rFile);
+      rFile.close();
+      return true;
+    }
+    else
+    {
+      return false;
+    }
+  }
+  //##### FILE SYSTEM . END #####
+  //##### LOG . BEGIN #####
+  enum SerialType
+  {
+    Info,
+    Warning,
+    Error
+  };
+  void SerialPrintInternal(SerialType _type, const char *msg)
+  {
+    switch (_type)
+    {
+    case SerialType::Info:
+      Serial.print("[INFO] ");
+      break;
+    case SerialType::Warning:
+      Serial.print("[WARN] ");
+      break;
+    case SerialType::Error:
+      Serial.print("[ERRO] ");
+      break;
+    default:
+      Serial.print("[DEFA] ");
+      break;
+    }
+    Serial.print(msg);
+    writeFileLog(_type, msg);
+    Serial.println();
+  }
+  void writeFileLog(SerialType _type, String msg)
+  {
+    if (!FILE_SYSTEM_OPEN)
+    {
+      return;
+    }
+    char bufferDateTime[19] = "NO_DATE_TIME";
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      NTP_TIME_CLIENT.update();
+      delay(50);
+      time_t epochTime = NTP_TIME_CLIENT.getEpochTime();
+      struct tm *ptm = gmtime((time_t *)&epochTime);
+      String currentDate = String(ptm->tm_year + 1900) + "-" + String(ptm->tm_mon + 1) + "-" + String(ptm->tm_mday);
+      String formattedTime = NTP_TIME_CLIENT.getFormattedTime();
+      sprintf(bufferDateTime, "%s %s",currentDate.c_str(), formattedTime.c_str());
+    }
+
+    DynamicJsonDocument docConfig(2048);
+    JsonObject objConfig;
+    objConfig = getFileFromObject(&docConfig, FILE_CONFIG_NAME);
+
+    String bufferType;
+    if (_type == SerialType::Info){
+      bufferType = "INFO";
+    } else if (_type == SerialType::Warning){
+      bufferType = "WARN";
+    } else if (_type == SerialType::Error){
+      bufferType = "ERROR";
+    } else{
+      bufferType = "DEFAULT";
+    }
+
+    char bufferLog[1024];
+    sprintf(bufferLog,"{\"datetime\":\"%s\",\"start\":%s,\"millis\":%s,\"type\":\"%s\",\"message\":\"%s\"},",bufferDateTime,objConfig["START"].as<String>(),String(millis()),bufferType,msg.c_str());
+    
+    Serial.print("    ");
+    Serial.print("\t");
+    File rFile = LittleFS.open("/log.txt","a+");
+    if(rFile){
+      rFile.println(bufferLog);
+      Serial.print(">>SAVE OK (");
+      Serial.print(rFile.size());
+      Serial.print(")");
+      rFile.close();
+    } else {
+      Serial.print(">>ERROR SAVE FILE");
+    }
+  }
+  void SerialPrint(SerialType _type, const String msg, ...)
+  {
+    char buffer[300];
+    va_list arg_ptr;
+    va_start(arg_ptr, msg);
+    vsprintf(buffer, msg.c_str(), arg_ptr);
+    va_end(arg_ptr);
+    SerialPrintInternal(_type, buffer);
+  }
+  void SerialPrint(SerialType _type, const char *msg)
+  {
+    SerialPrintInternal(_type, msg);
+  }
+  //##### LOG . END #####
+  kernelDevice* devices[10] = {};
+public:
+typedef enum {
+  ESP01S = 001,
+  ESP12F = 012,
+  ESP07 = 007,
+  NODEMCU = 100
+} boardModel;
+  uint8_t currentDeviceCount = 0;
+  uint8_t addDevice(kernelDevice* d){
+    devices[currentDeviceCount] = d;
+    return ++currentDeviceCount;
+  }
+  void init(String identificationBoard, boardModel _modelMicroController, uint8_t _ledStatus = -1)
+  {
+    boolean file_exist = true;
+    String file_exist_name;
+    openLittleFS();
+
+    SerialPrint(SerialType::Info, "Booting Board, Wait...");
+
+    if (!checkFileExist("/bootstrap.min.css")){
+      file_exist = false;
+      file_exist_name = "bootstrap.min.css";
+    }
+    if (!checkFileExist("/jquery.min.js")){
+      file_exist = false;
+      file_exist_name = "jquery.min.js";
+    }
+    if (!checkFileExist("/jquery.mask.min.js")){
+      file_exist = false;
+      file_exist_name = "jquery.mask.min.js";
+    }
+
+    if (!file_exist){
+      SerialPrint(SerialType::Info, "Dependency not found [" + file_exist_name + "], check files!");
+      delay(2000);
+      SerialPrint(SerialType::Info, "Restarting board, Wait...");
+      delay(2000);
+      ESP.reset();
+    }
+
+    DynamicJsonDocument doc (1024);
+    JsonObject obj = getFileFromObject(&doc, FILE_CONFIG_NAME);
+    if (obj.containsKey("START")){
+      obj["START"] = (int)obj["START"] + 1;
+    }else{
+      obj["START"] = 0;
+    }
+    if ((int)obj["START"] == 0){
+      SerialPrint(SerialType::Info, "First time executing, Wait...");
+      obj["MAC"] = WiFi.macAddress();
+      char out[20];
+      sprintf(out, "%X", ESP.getChipId());
+      obj["CHIP"] = out;
+      obj["FLASH_SIZE"] = ESP.getFlashChipRealSize();
+
+      //For login system
+      obj["LOGIN_USER"] = "";
+      obj["LOGIN_PWD"] = "";
+
+      //Settings
+      obj["BOARD_NAME"] = "";
+      obj["SERVER_TYPE"] = "";
+      obj["SERVER_IP"] = "";
+      obj["SERVER_PORT"] = "1883";
+      obj["SERVER_USER"] = "";
+      obj["SERVER_PWD"] = "";
+
+      //Wifi Config
+      obj.createNestedArray("WIFI_NETWORKS");
+      saveConfigFile(&doc);
+      SerialPrint(SerialType::Info, "Restarting board, Wait...");
+      delay(2000);
+      ESP.reset();
+    }
+    saveConfigFile(&doc);
+    SerialPrint(SerialType::Info, "Chip id: %s", configLoad.CHIP_ID.c_str());
+    SerialPrint(SerialType::Info, "MAC: %s", configLoad.MAC.c_str());
+    delay (100);
+
+  }
+  std::function<void()> connectWifi = [=]() {
+    bool CONNECTED = false;
+    WIFI_STA_INICIALIZED = false;
+    WiFi.mode(WIFI_STA);
+    if (configLoad.sizeListWifi <= 0){
+      SerialPrint(SerialType::Info, "NOT DISCOVERY NETWORK SIGN UP");
+    }
+    for (int i=0; i < configLoad.sizeListWifi; i++) {
+      int retries = 0;
+      String ssid = configLoad.wifiListNetwork[i].SSID;
+      String pwd = configLoad.wifiListNetwork[i].PWD;
+      SerialPrint(SerialType::Info, "CONNECT WIFI NETWORK: %s", ssid.c_str());
+      WiFi.begin(ssid, pwd.c_str());
+      while(WiFi.status()!=WL_CONNECTED && retries<20)
+      {
+        retries++;
+        delay(1000);
+      }
+      if(retries==20)//Timeout has occured
+      {
+        SerialPrint(SerialType::Error, "UNABLE TO CONNECT WIFI NETWORK: %s", ssid.c_str());
+      }
+      if(WiFi.status()==WL_CONNECTED)//WiFi has succesfully Connected
+      {
+        CONNECTED = true;
+        WIFI_STA_INICIALIZED = true;
+        i = configLoad.sizeListWifi;
+        SerialPrint(SerialType::Info, "CONNECTED WIFI NETWORK: %s , IP ADDRESS: %d.%d.%d.%d", ssid.c_str(), WiFi.localIP()[0], WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3]);
+        connectServer();
+      }
+    }
+    if (!CONNECTED){
+      SerialPrint(SerialType::Warning, "ENABLE DNS SERVER");
+      WiFi.enableSTA(false);
+      WiFi.mode(WIFI_AP);
+      IPAddress apIP(192, 168, 4, 1);
+      IPAddress netMsk(255, 255, 255, 0);
+      WiFi.softAPConfig(apIP, apIP, netMsk);
+      char name_board_ap[20];
+      if (configLoad.BoardName == ""){
+        sprintf(name_board_ap, "BOARD-CONFIG-%s", configLoad.CHIP_ID.c_str());
+      }else{
+        sprintf(name_board_ap, "BOARD-CONFIG-%s-%s", configLoad.CHIP_ID.c_str(), configLoad.BoardName.c_str());
+      }
+      WiFi.softAP(name_board_ap, "Tolfin123");
+      delay(500);
+      DNS_SERVER.setErrorReplyCode(DNSReplyCode::NoError);
+      DNS_SERVER.start(DNS_PORT, "*", apIP);
+    }
+    startServerWeb();
+    WEB_SERVER.begin();
+    connectWifiTicker.detach();
+  };
+  
+  std::function<void(char*, byte*, unsigned int)> callbackCustomMQTT = [=](char* topic, byte* payload, unsigned int length) {
+    char message[length + 1];
+    for (int i = 0; i < length; i++) {
+      message[i] = (char)payload[i];
+    }
+    for (int i = 0; i<currentDeviceCount; i++){
+      if (devices[i]->getReceiver() == *topic){
+        devices[i]->receiver(message);
+      }
+    }
+  };
+  std::function<void()> connectServer = [=]() {
+    if (configLoad.ServerType == "MQTT"){
+      MQTT_INICIALIZED = true;
+      SerialPrint(SerialType::Info, "CONNECT MQTT SERVER; IP: %s , PORT: %d ,  USER: %s , PASS: %s", configLoad.ServerIP.c_str(),configLoad.serverPort, configLoad.ServerUser.c_str(), configLoad.ServerPWD.c_str());
+      clientMQTT.setClient(espClient);
+      clientMQTT.setServer(configLoad.ServerIP.c_str(),configLoad.serverPort);
+      clientMQTT.setCallback(callbackCustomMQTT);
+      String client_id = String(WiFi.macAddress());
+      if (clientMQTT.connect(client_id.c_str(), configLoad.ServerUser.c_str(), configLoad.ServerPWD.c_str())) 
+      {
+        delay(1500);
+        for (int i = 0; i<currentDeviceCount; i++){
+          devices[i]->setClient(clientMQTT);
+          clientMQTT.subscribe(devices[i]->mqtt_receiver);
+    }
+        SerialPrint(SerialType::Info, "MQTT CONNECTED");
+      }
+      else 
+      {
+        SerialPrint(SerialType::Error, "MQTT ERROR CONNECT: %i", clientMQTT.state());
+        delay(5000);
+      } 
+    }
+    connectServerTicker.detach();
+  };
+  void Start()
+  {
+    connectWifi();
+  }
+  Ticker connectServerTicker;
+  Ticker connectWifiTicker;
+  void loop()
+  {
+    if (MQTT_INICIALIZED && clientMQTT.connected()){
+      clientMQTT.loop();
+    }
+    if (WIFI_STA_INICIALIZED && WiFi.status()!=WL_CONNECTED){
+      WIFI_STA_INICIALIZED = false;
+      SerialPrint(SerialType::Warning, "WIFI DISCONNECTED, RECONNECTING");
+      connectWifiTicker.once(10, connectWifi);
+    }
+    if (MQTT_INICIALIZED && !clientMQTT.connected()){
+      if (!connectServerTicker.active()){
+        SerialPrint(SerialType::Warning, "SERVER DISCONNECTED, RECONNECTING; STATUS: %d", clientMQTT.state());
+        connectServerTicker.once(10, connectServer);
+      }
+    }
+    if (!WIFI_STA_INICIALIZED && WiFi.status()!=WL_CONNECTED){
+      DNS_SERVER.processNextRequest();
+    }
+
+  }
+};
+
+kernelSystemControl kernelSC;
